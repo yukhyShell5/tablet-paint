@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { getStroke } from 'perfect-freehand';
 import { useStore } from '../store';
-import type { Tool, Point, Stroke, Layer } from '../store';
+import type { Tool, Stroke, Layer } from '../store';
 
 declare global {
   interface Window {
@@ -203,7 +203,6 @@ const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer:
     e.currentTarget.setPointerCapture(e.pointerId);
     
     let startX = e.clientX;
-    let startY = e.clientY;
     let startW = w;
     let startH = h;
     let startPX = point.x;
@@ -251,8 +250,6 @@ const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer:
     e.currentTarget.setPointerCapture(e.pointerId);
     
     // Le centre de l'image
-    const cx = x + w / 2;
-    const cy = y + h / 2;
 
     const onPointerMove = (moveEvent: PointerEvent) => {
       // Trouver la position de la souris dans le canvas

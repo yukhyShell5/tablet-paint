@@ -288,6 +288,7 @@ function App() {
           points: [{ x: 0, y: 0, pressure: 0.5 }],
           color: '#000000',
           size: 1,
+          opacity: 1,
           imageUrl: dataUrl,
           layerId: newLayerId
         });
