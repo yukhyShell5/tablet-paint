@@ -164,7 +164,9 @@ export const useStore = create<AppState>()(
     if (state.layers.length <= 1) return state; // Impossible de supprimer le dernier calque
     const newLayers = state.layers.filter(l => l.id !== id);
     const newActiveId = state.activeLayerId === id ? newLayers[0].id : state.activeLayerId;
-    return { layers: newLayers, activeLayerId: newActiveId };
+    // Supprimer aussi les strokes orphelins du calque supprimé
+    const newStrokes = state.strokes.filter(s => s.layerId !== id);
+    return { layers: newLayers, activeLayerId: newActiveId, strokes: newStrokes };
   }),
   
   setActiveLayer: (id) => set({ activeLayerId: id }),

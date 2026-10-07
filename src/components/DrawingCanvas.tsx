@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { getStroke } from 'perfect-freehand';
 import { useStore } from '../store';
 import type { Tool, Stroke, Layer } from '../store';
@@ -9,8 +9,8 @@ declare global {
   }
 }
 
-// Fonction utilitaire pour le rendu d'un trait (stroke)
-const renderStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke, layerBackground: 'transparent' | 'white') => {
+// Fonction utilitaire pour le rendu d'un trait (stroke) — exportée pour l'export PNG
+export const renderStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke, layerBackground: 'transparent' | 'white') => {
   if (stroke.points.length === 0) return;
 
   ctx.globalAlpha = stroke.opacity ?? 1;
@@ -119,63 +119,158 @@ const renderStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke, layerBackgr
     }
     ctx.fill(path);
   }
+  // Toujours réinitialiser après chaque stroke pour éviter la contamination
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
 };
 
-// Composant qui rend un seul calque
-const LayerCanvas = ({ layer, strokes, width, height, isActive, currentStroke }: { layer: Layer, strokes: Stroke[], width: number, height: number, isActive: boolean, currentStroke: Stroke | null }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+export interface LayerCanvasRef {
+  redrawWithDraft: (draftStroke: Stroke | null) => void;
+  commitStroke: (stroke: Stroke) => void;
+}
+
+const LayerCanvas = React.forwardRef<LayerCanvasRef, { layer: Layer, allStrokes: Stroke[], width: number, height: number, zoom: number }>(({ layer, allStrokes, width, height, zoom }, ref) => {
+  const visibleCanvasRef = useRef<HTMLCanvasElement>(null);
+  const cacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  
+  if (!cacheCanvasRef.current && typeof document !== 'undefined') {
+    cacheCanvasRef.current = document.createElement('canvas');
+  }
+  
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+
+  // La taille du canvas inclut le zoom pour garantir une qualité nette (pas de pixelisation)
+  const physicalWidth  = Math.round(width  * zoom * dpr);
+  const physicalHeight = Math.round(height * zoom * dpr);
+  const cacheWidth  = physicalWidth;
+  const cacheHeight = physicalHeight;
+
+  // Optimisation du rendu avec la technique du "dirty rectangle" (boîte englobante)
+  // Cela permet de ne redessiner que la petite zone modifiée par le trait en cours,
+  // ce qui évite les lags même avec un très grand canvas zoomé à 300%.
+  const redrawWithDraft = (draftStroke: Stroke | null) => {
+    const visibleCanvas = visibleCanvasRef.current;
+    const cacheCanvas = cacheCanvasRef.current;
+    if (!visibleCanvas || !cacheCanvas) return;
+    const ctx = visibleCanvas.getContext('2d');
+    if (!ctx) return;
+
+    if (draftStroke && draftStroke.points.length > 0) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const p of draftStroke.points) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      
+      let margin = draftStroke.size * 2 + 50;
+      if (draftStroke.tool === 'image') {
+        margin += Math.max(draftStroke.imageWidth || 800, draftStroke.imageHeight || 800);
+      }
+      
+      const pxX = (minX + (layer.offsetX || 0) - margin) * zoom * dpr;
+      const pxY = (minY + (layer.offsetY || 0) - margin) * zoom * dpr;
+      const pxMaxX = (maxX + (layer.offsetX || 0) + margin) * zoom * dpr;
+      const pxMaxY = (maxY + (layer.offsetY || 0) + margin) * zoom * dpr;
+      
+      const dx = Math.max(0, Math.floor(pxX));
+      const dy = Math.max(0, Math.floor(pxY));
+      const dw = Math.min(visibleCanvas.width - dx, Math.ceil(pxMaxX - dx));
+      const dh = Math.min(visibleCanvas.height - dy, Math.ceil(pxMaxY - dy));
+      
+      if (dw > 0 && dh > 0) {
+        ctx.clearRect(dx, dy, dw, dh);
+        if (cacheCanvas.width > 0 && cacheCanvas.height > 0) {
+          ctx.drawImage(cacheCanvas, dx, dy, dw, dh, dx, dy, dw, dh);
+        }
+      }
+    } else {
+      ctx.clearRect(0, 0, visibleCanvas.width, visibleCanvas.height);
+      if (cacheCanvas.width > 0 && cacheCanvas.height > 0) {
+        ctx.drawImage(cacheCanvas, 0, 0);
+      }
+    }
+
+    if (draftStroke) {
+      ctx.save();
+      ctx.scale(zoom * dpr, zoom * dpr);
+      ctx.translate(layer.offsetX || 0, layer.offsetY || 0);
+      renderStroke(ctx, draftStroke, layer.background);
+      ctx.restore();
+    }
+  };
+
+  // Valide un trait IMMÉDIATEMENT dans le cache (évite le flash/point à la fin du trait)
+  const commitStroke = (stroke: Stroke) => {
+    const cacheCanvas = cacheCanvasRef.current;
+    if (!cacheCanvas) return;
+    const ctx = cacheCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.save();
+    ctx.scale(zoom * dpr, zoom * dpr);
+    ctx.translate(layer.offsetX || 0, layer.offsetY || 0);
+    renderStroke(ctx, stroke, layer.background);
+    ctx.restore();
+    redrawWithDraft(null);
+  };
+
+  React.useImperativeHandle(ref, () => ({
+    redrawWithDraft,
+    commitStroke,
+  }), [zoom, dpr, layer.offsetX, layer.offsetY, layer.background]);
 
   useEffect(() => {
-    const draw = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+    const cacheCanvas = cacheCanvasRef.current;
+    if (!cacheCanvas) return;
 
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (cacheCanvas.width !== cacheWidth || cacheCanvas.height !== cacheHeight) {
+      cacheCanvas.width = cacheWidth;
+      cacheCanvas.height = cacheHeight;
+    }
 
-      ctx.save();
-      ctx.translate(layer.offsetX || 0, layer.offsetY || 0);
+    const ctx = cacheCanvas.getContext('2d');
+    if (!ctx) return;
+    
+    ctx.clearRect(0, 0, cacheCanvas.width, cacheCanvas.height);
+    ctx.save();
+    ctx.scale(zoom * dpr, zoom * dpr); 
+    ctx.translate(layer.offsetX || 0, layer.offsetY || 0);
 
-      if (layer.background === 'white') {
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(-(layer.offsetX || 0), -(layer.offsetY || 0), canvas.width, canvas.height);
-      }
+    if (layer.background === 'white') {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-(layer.offsetX || 0), -(layer.offsetY || 0), width, height);
+    }
 
-      // On dessine tous les traits du calque
-      strokes.forEach(stroke => renderStroke(ctx, stroke, layer.background));
-      
-      // Si c'est le calque actif, on dessine aussi le trait en cours
-      if (isActive && currentStroke) {
-        renderStroke(ctx, currentStroke, layer.background);
-      }
-      
-      ctx.restore();
-      ctx.globalCompositeOperation = 'source-over'; // reset
-    };
-
-    draw();
-    // Le setTimeout permet d'éviter un bug d'effacement du buffer canvas par certains navigateurs lors des transitions DOM.
-    const timeoutId = setTimeout(draw, 50);
-    return () => clearTimeout(timeoutId);
-  }, [strokes, currentStroke, isActive, layer.opacity, layer.visible, layer.background, layer.offsetX, layer.offsetY, width, height]);
+    const layerStrokes = allStrokes.filter(s => s.layerId === layer.id);
+    layerStrokes.forEach(stroke => renderStroke(ctx, stroke, layer.background));
+    
+    ctx.restore();
+    
+    redrawWithDraft(null);
+  }, [allStrokes, layer.id, layer.background, layer.offsetX, layer.offsetY, width, height, dpr, zoom]);
 
   return (
     <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
+      ref={visibleCanvasRef}
+      width={physicalWidth}
+      height={physicalHeight}
       style={{
         position: 'absolute',
         top: 0,
         left: 0,
+        width: '100%',
+        height: '100%',
         opacity: layer.opacity,
         display: layer.visible ? 'block' : 'none',
         pointerEvents: 'none'
       }}
     />
   );
-};
+});
 
 const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer: Layer, zoom: number }) => {
   const { updateStroke } = useStore();
@@ -209,8 +304,6 @@ const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer:
     let startPY = point.y;
 
     const onPointerMove = (moveEvent: PointerEvent) => {
-      // Note: redimensionner un objet déjà tourné demande des maths complexes,
-      // pour le moment on garde une approximation simple de la taille avec la souris.
       const dx = (moveEvent.clientX - startX) / zoom;
       
       let newW = startW;
@@ -249,24 +342,17 @@ const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer:
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     
-    // Le centre de l'image
-
     const onPointerMove = (moveEvent: PointerEvent) => {
-      // Trouver la position de la souris dans le canvas
       const containerRect = document.querySelector('.main-canvas-container')?.getBoundingClientRect();
       if (!containerRect) return;
       
       const mx = ((moveEvent.clientX - containerRect.left) / zoom) - (layer.offsetX || 0);
       const my = ((moveEvent.clientY - containerRect.top) / zoom) - (layer.offsetY || 0);
       
-      // Centre de l'image (sans l'offset car mx/my ont l'offset soustrait)
       const centerImgX = point.x + w / 2;
       const centerImgY = point.y + h / 2;
 
-      // Calcul de l'angle
       const angle = Math.atan2(my - centerImgY, mx - centerImgX);
-      
-      // On ajoute PI/2 car la poignée de rotation est en haut (à -90 degrés)
       updateStroke(stroke.id, { rotation: angle + Math.PI / 2 });
     };
 
@@ -280,46 +366,42 @@ const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer:
     window.addEventListener('pointerup', onPointerUp);
   };
 
-  const handleSize = 10 / zoom;
+  const handleSize = 10;
 
   return (
     <div style={{
       position: 'absolute',
-      left: x,
-      top: y,
-      width: w,
-      height: h,
-      border: `${2 / zoom}px dashed #4a90e2`,
+      left: x * zoom,
+      top: y * zoom,
+      width: w * zoom,
+      height: h * zoom,
+      border: `2px dashed #4a90e2`,
       pointerEvents: 'none',
       transform: `rotate(${stroke.rotation || 0}rad)`,
       transformOrigin: 'center center'
     }}>
-      {/* Poignée de rotation (en haut au centre) */}
       <div 
         onPointerDown={handleRotate}
         style={{
-          position: 'absolute', left: '50%', top: -30 / zoom - handleSize/2, width: handleSize, height: handleSize,
+          position: 'absolute', left: '50%', top: -30 - handleSize/2, width: handleSize, height: handleSize,
           transform: 'translateX(-50%)',
           backgroundColor: '#4a90e2', borderRadius: '50%', cursor: 'grab', pointerEvents: 'auto'
         }} 
       >
-        <div style={{ position: 'absolute', left: '50%', top: handleSize, width: `${2 / zoom}px`, height: `${30 / zoom}px`, backgroundColor: '#4a90e2', transform: 'translateX(-50%)' }} />
+        <div style={{ position: 'absolute', left: '50%', top: handleSize, width: `2px`, height: `30px`, backgroundColor: '#4a90e2', transform: 'translateX(-50%)' }} />
       </div>
-
-      {/* Coin Supérieur Gauche */}
       <div 
         onPointerDown={(e) => handleResize(e, 'tl')}
         style={{
           position: 'absolute', left: -handleSize/2, top: -handleSize/2, width: handleSize, height: handleSize,
-          backgroundColor: '#fff', border: `${1 / zoom}px solid #4a90e2`, cursor: 'nwse-resize', pointerEvents: 'auto', borderRadius: '50%'
+          backgroundColor: '#fff', border: `1px solid #4a90e2`, cursor: 'nwse-resize', pointerEvents: 'auto', borderRadius: '50%'
         }} 
       />
-      {/* Coin Inférieur Droit */}
       <div 
         onPointerDown={(e) => handleResize(e, 'br')}
         style={{
           position: 'absolute', right: -handleSize/2, bottom: -handleSize/2, width: handleSize, height: handleSize,
-          backgroundColor: '#fff', border: `${1 / zoom}px solid #4a90e2`, cursor: 'nwse-resize', pointerEvents: 'auto', borderRadius: '50%'
+          backgroundColor: '#fff', border: `1px solid #4a90e2`, cursor: 'nwse-resize', pointerEvents: 'auto', borderRadius: '50%'
         }} 
       />
     </div>
@@ -329,18 +411,23 @@ const ImageTransformOverlay = ({ stroke, layer, zoom }: { stroke: Stroke, layer:
 export function DrawingCanvas() {
   const { currentTool, color, strokeWidth, strokeOpacity, strokes, addStroke, layers, activeLayerId, zoom, pan, setZoom, setPan, setLayerOffset, projectWidth, projectHeight } = useStore();
   
-  const [currentStroke, setCurrentStroke] = useState<Stroke | null>(null);
-  const [isDrawing, setIsDrawing] = useState(false);
+  // Utilisation de refs pour éviter les re-rendus React à chaque pixel de mouvement ! (Évite le lag)
+  const currentStrokeRef = useRef<Stroke | null>(null);
+  const layerRefs = useRef<Record<string, LayerCanvasRef>>({});
+  const rafRef = useRef<number | null>(null);
+  // isDrawingRef = source de vérité synchrone (pas de batch React)
+  const isDrawingRef = useRef(false);
+
   const lastPanPoint = useRef<{x: number, y: number} | null>(null);
   const lastMovePoint = useRef<{x: number, y: number} | null>(null);
   
   const width = projectWidth || 1200;
   const height = projectHeight || 800;
   const containerRef = useRef<HTMLDivElement>(null);
+  const innerCanvasRef = useRef<HTMLDivElement>(null);
 
   const cursorRef = useRef<HTMLDivElement>(null);
 
-  // Gestion du Zoom natif
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -348,11 +435,9 @@ export function DrawingCanvas() {
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
       if (e.ctrlKey || e.metaKey) {
-        // Zoom
-        const zoomDelta = e.deltaY > 0 ? -0.1 : 0.1;
-        setZoom(Math.max(0.1, Math.min(5, useStore.getState().zoom + zoomDelta)));
+        const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+        setZoom(Math.max(0.1, Math.min(3, useStore.getState().zoom * zoomFactor)));
       } else {
-        // Pan
         setPan((prev) => ({ x: prev.x - e.deltaX, y: prev.y - e.deltaY }));
       }
     };
@@ -364,12 +449,18 @@ export function DrawingCanvas() {
   const updateCursorPosition = (e: React.PointerEvent) => {
     if (cursorRef.current && (currentTool === 'brush' || currentTool === 'eraser')) {
       cursorRef.current.style.display = 'block';
-      cursorRef.current.style.left = `${e.clientX}px`;
-      cursorRef.current.style.top = `${e.clientY}px`;
+      // L'utilisation de transform GPU est beaucoup plus fluide que modifier left/top
+      cursorRef.current.style.transform = `translate(${e.clientX}px, ${e.clientY}px) translate(-50%, -50%)`;
       cursorRef.current.style.width = `${strokeWidth * zoom}px`;
       cursorRef.current.style.height = `${strokeWidth * zoom}px`;
     } else if (cursorRef.current) {
       cursorRef.current.style.display = 'none';
+    }
+  };
+
+  const drawDraft = () => {
+    if (activeLayerId && layerRefs.current[activeLayerId]) {
+      layerRefs.current[activeLayerId].redrawWithDraft(currentStrokeRef.current);
     }
   };
 
@@ -378,41 +469,53 @@ export function DrawingCanvas() {
     
     if (currentTool === 'pan' || e.button === 1) {
       lastPanPoint.current = { x: e.clientX, y: e.clientY };
-      setIsDrawing(true);
+      isDrawingRef.current = true;
       return;
     }
     
     if (currentTool === 'move') {
       lastMovePoint.current = { x: e.clientX, y: e.clientY };
-      setIsDrawing(true);
+      isDrawingRef.current = true;
       return;
     }
-    
-    const rect = e.currentTarget.getBoundingClientRect();
+
+    // Ne pas dessiner sur un calque invisible
     const activeLayer = layers.find(l => l.id === activeLayerId);
+    if (!activeLayer?.visible) return;
+    
+    const rect = innerCanvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
     const offsetX = activeLayer?.offsetX || 0;
     const offsetY = activeLayer?.offsetY || 0;
     
     const x = ((e.clientX - rect.left) / zoom) - offsetX;
     const y = ((e.clientY - rect.top) / zoom) - offsetY;
-    const pressure = e.pressure !== 0 ? e.pressure : 0.5;
+    // Pour le stylet, utiliser la vraie pression ; pour souris/doigt, simuler 0.5
+    const pressure = e.pointerType === 'pen' ? (e.pressure > 0 ? e.pressure : 0.5) : 0.5;
 
-    setIsDrawing(true);
-    setCurrentStroke({
-      id: `stroke-${Date.now()}`,
+    isDrawingRef.current = true;
+    currentStrokeRef.current = {
+      id: `stroke-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       tool: currentTool as Exclude<Tool, 'pan' | 'move'>,
       color,
       size: strokeWidth,
       opacity: strokeOpacity,
       points: [{ x, y, pressure }],
       layerId: activeLayerId
-    });
+    };
+
+    if (rafRef.current === null) {
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        drawDraft();
+      });
+    }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     updateCursorPosition(e);
 
-    if (!isDrawing) return;
+    if (!isDrawingRef.current) return;
 
     if (lastPanPoint.current) {
       const dx = e.clientX - lastPanPoint.current.x;
@@ -430,55 +533,72 @@ export function DrawingCanvas() {
       return;
     }
 
-    if (!currentStroke) return;
+    if (!currentStrokeRef.current) return;
 
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect = innerCanvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
     const activeLayer = layers.find(l => l.id === activeLayerId);
     const offsetX = activeLayer?.offsetX || 0;
     const offsetY = activeLayer?.offsetY || 0;
 
     const x = ((e.clientX - rect.left) / zoom) - offsetX;
     const y = ((e.clientY - rect.top) / zoom) - offsetY;
-    const pressure = e.pressure !== 0 ? e.pressure : 0.5;
+    const pressure = e.pointerType === 'pen' ? (e.pressure > 0 ? e.pressure : 0.5) : 0.5;
 
-    setCurrentStroke(prev => {
-      if (!prev) return null;
-      if (currentTool === 'ruler' || currentTool === 'circle') {
-        return { ...prev, points: [prev.points[0], { x, y, pressure }] };
-      }
-      return { ...prev, points: [...prev.points, { x, y, pressure }] };
-    });
+    if (currentTool === 'ruler' || currentTool === 'circle') {
+      currentStrokeRef.current.points[1] = { x, y, pressure };
+    } else {
+      currentStrokeRef.current.points.push({ x, y, pressure });
+    }
+
+    if (rafRef.current === null) {
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        drawDraft();
+      });
+    }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    setIsDrawing(false);
+    isDrawingRef.current = false;
     
     if (lastPanPoint.current) {
       lastPanPoint.current = null;
     } else if (lastMovePoint.current) {
       lastMovePoint.current = null;
-    } else if (currentStroke) {
-      addStroke(currentStroke);
-      setCurrentStroke(null);
+    } else if (currentStrokeRef.current) {
+      // Annuler tout RAF en attente
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      const stroke = currentStrokeRef.current;
+      currentStrokeRef.current = null;
+
+      // 1. Committer le trait IMMÉDIATEMENT dans le cache visuel (aucun flash, aucun point parasite)
+      layerRefs.current[activeLayerId]?.commitStroke(stroke);
+      // 2. Persister dans le store Zustand (déclenche useEffect de rebuild, idempotent)
+      addStroke(stroke);
     }
     
     e.currentTarget.releasePointerCapture(e.pointerId);
   };
 
   const handlePointerLeave = () => {
-    if (cursorRef.current && !isDrawing) {
+    if (cursorRef.current && !isDrawingRef.current) {
       cursorRef.current.style.display = 'none';
     }
   };
 
   return (
     <div 
-      style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }} 
+      style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: (currentTool === 'pan') ? 'grab' : 'auto' }} 
       ref={containerRef}
-      onPointerMove={updateCursorPosition}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
       onPointerLeave={handlePointerLeave}
     >
-      {/* Curseur personnalisé */}
       <div 
         ref={cursorRef}
         style={{
@@ -487,6 +607,8 @@ export function DrawingCanvas() {
           borderRadius: '50%',
           border: '1px solid rgba(0,0,0,0.5)',
           boxShadow: '0 0 0 1px rgba(255,255,255,0.5)',
+          left: 0,
+          top: 0,
           transform: 'translate(-50%, -50%)',
           zIndex: 9999,
           display: 'none',
@@ -494,48 +616,43 @@ export function DrawingCanvas() {
         }}
       />
       <div 
+        ref={innerCanvasRef}
         className="main-canvas-container"
         style={{
           flexShrink: 0,
-          width,
-          height,
-          transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+          width: width * zoom,
+          height: height * zoom,
+          transform: `translate(${pan.x}px, ${pan.y}px)`,
           transformOrigin: 'center center',
-          // Damier pour représenter la transparence globale
           backgroundColor: '#e5e5e5',
           backgroundImage: `
             linear-gradient(45deg, #f3f3f3 25%, transparent 25%, transparent 75%, #f3f3f3 75%, #f3f3f3),
             linear-gradient(45deg, #f3f3f3 25%, transparent 25%, transparent 75%, #f3f3f3 75%, #f3f3f3)
           `,
-          backgroundSize: '20px 20px',
-          backgroundPosition: '0 0, 10px 10px',
+          backgroundSize: `${20 * zoom}px ${20 * zoom}px`,
+          backgroundPosition: `0 0, ${10 * zoom}px ${10 * zoom}px`,
           boxShadow: '0 4px 20px rgba(0, 0, 0, 0.5)',
           cursor: (currentTool === 'brush' || currentTool === 'eraser') ? 'none' : currentTool === 'pan' ? 'grab' : currentTool === 'move' ? 'move' : 'crosshair',
         }}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
         onContextMenu={(e) => e.preventDefault()}
       >
-      {/* On rend les calques dans l'ordre inverse pour que le premier calque du tableau soit visuellement au-dessus */}
       {[...layers].reverse().map(layer => {
-        const layerStrokes = strokes.filter(s => s.layerId === layer.id);
-        const isActive = activeLayerId === layer.id;
-        
         return (
           <LayerCanvas 
             key={layer.id}
+            ref={(el) => { 
+              if (el) layerRefs.current[layer.id] = el; 
+              else delete layerRefs.current[layer.id];
+            }}
             layer={layer}
-            strokes={layerStrokes}
+            allStrokes={strokes}
             width={width}
             height={height}
-            isActive={isActive}
-            currentStroke={currentStroke}
+            zoom={zoom}
           />
         );
       })}
       
-      {/* Overlay de transformation d'image (affiché uniquement si l'outil move est actif et qu'on a une image sur le calque actif) */}
       {currentTool === 'move' && activeLayerId && (() => {
         const activeLayerStrokes = strokes.filter(s => s.layerId === activeLayerId);
         const imageStroke = activeLayerStrokes.find(s => s.tool === 'image');
@@ -545,6 +662,25 @@ export function DrawingCanvas() {
         }
         return null;
       })()}
+      </div>
+
+      {/* Indicateur de Zoom */}
+      <div style={{
+        position: 'absolute',
+        bottom: '20px',
+        right: '20px',
+        backgroundColor: 'rgba(0, 0, 0, 0.6)',
+        color: 'white',
+        padding: '6px 12px',
+        borderRadius: '6px',
+        fontSize: '14px',
+        pointerEvents: 'none',
+        zIndex: 9999,
+        fontFamily: 'monospace',
+        fontWeight: 'bold',
+        backdropFilter: 'blur(4px)'
+      }}>
+        {Math.round(zoom * 100)}%
       </div>
     </div>
   );

@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Pen, Eraser, Ruler, Circle, Image as ImageIcon, Download, Undo, Redo, Layers, Eye, EyeOff, Plus, Trash2, ArrowUp, ArrowDown, Hand, ZoomIn, ZoomOut, Maximize, Move, File, Save, FolderOpen, Pencil } from 'lucide-react';
 import { useStore } from './store';
 import { useProjectsStore, loadProjectData } from './projectsStore';
 import type { Tool } from './store';
-import { DrawingCanvas } from './components/DrawingCanvas';
+import { DrawingCanvas, renderStroke } from './components/DrawingCanvas';
 import './App.css';
 
 function App() {
@@ -14,11 +14,34 @@ function App() {
     addStroke,
     projectWidth, projectHeight, setProjectSize, closeProject, loadProject,
     layers, activeLayerId, addLayer, removeLayer, setActiveLayer, toggleLayerVisibility, moveLayer, reorderLayer,
-    zoom, setZoom, setPan
+    setZoom, setPan
   } = useStore();
 
-  const handleZoomIn = () => setZoom(Math.min(5, zoom + 0.1));
-  const handleZoomOut = () => setZoom(Math.max(0.1, zoom - 0.1));
+  const zoomInterval = useRef<number | null>(null);
+
+  const startZoomIn = () => {
+    if (zoomInterval.current) return;
+    setZoom(Math.min(3, useStore.getState().zoom * 1.1));
+    zoomInterval.current = window.setInterval(() => {
+      setZoom(Math.min(3, useStore.getState().zoom * 1.05));
+    }, 100);
+  };
+
+  const startZoomOut = () => {
+    if (zoomInterval.current) return;
+    setZoom(Math.max(0.1, useStore.getState().zoom / 1.1));
+    zoomInterval.current = window.setInterval(() => {
+      setZoom(Math.max(0.1, useStore.getState().zoom / 1.05));
+    }, 100);
+  };
+
+  const stopZoom = () => {
+    if (zoomInterval.current) {
+      clearInterval(zoomInterval.current);
+      zoomInterval.current = null;
+    }
+  };
+
   const handleResetView = () => {
     setZoom(1);
     setPan({ x: 0, y: 0 });
@@ -35,14 +58,21 @@ function App() {
     // Initial load
     useProjectsStore.getState().loadProjects();
 
-    // Auto-save current project to IndexedDB
+    // Auto-save avec debounce de 1500ms pour ne pas sauvegarder à chaque trait
+    let saveTimeout: number | null = null;
     const unsub = useStore.subscribe((state) => {
       if (state.projectId && state.projectWidth && state.projectHeight) {
-        useProjectsStore.getState().saveProject(state.projectId, state.projectName, state);
+        if (saveTimeout) clearTimeout(saveTimeout);
+        saveTimeout = window.setTimeout(() => {
+          useProjectsStore.getState().saveProject(state.projectId!, state.projectName, state);
+        }, 1500);
       }
     });
 
-    return unsub;
+    return () => {
+      unsub();
+      if (saveTimeout) clearTimeout(saveTimeout);
+    };
   }, []);
 
   useEffect(() => {
@@ -237,24 +267,46 @@ function App() {
   };
 
   const handleExport = () => {
-    // Créer un canvas temporaire pour fusionner tous les calques
+    const state = useStore.getState();
+    const pw = state.projectWidth || 1200;
+    const ph = state.projectHeight || 800;
+
     const exportCanvas = document.createElement('canvas');
-    exportCanvas.width = projectWidth || 1200;
-    exportCanvas.height = projectHeight || 800;
+    exportCanvas.width = pw;
+    exportCanvas.height = ph;
     const ctx = exportCanvas.getContext('2d');
     if (!ctx) return;
-    
-    // Fond transparent (les calques gèrent eux-mêmes leur fond)
-    ctx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
 
-    // Dessiner chaque calque visible sur le canvas temporaire
-    const layerCanvases = document.querySelectorAll('.main-canvas-container canvas');
-    layerCanvases.forEach((canvas) => {
-      if ((canvas as HTMLElement).style.display !== 'none') {
-        ctx.globalAlpha = parseFloat((canvas as HTMLElement).style.opacity || '1');
-        ctx.drawImage(canvas as HTMLCanvasElement, 0, 0);
+    // Dessiner les calques dans l'ordre inverse (bas → haut) en espace projet (1:1, sans zoom)
+    const orderedLayers = [...state.layers].reverse();
+    for (const layer of orderedLayers) {
+      if (!layer.visible) continue;
+
+      // Canvas offscreen par calque pour isoler l'opacité
+      const layerCanvas = document.createElement('canvas');
+      layerCanvas.width = pw;
+      layerCanvas.height = ph;
+      const lctx = layerCanvas.getContext('2d');
+      if (!lctx) continue;
+
+      lctx.save();
+      lctx.translate(layer.offsetX || 0, layer.offsetY || 0);
+
+      if (layer.background === 'white') {
+        lctx.fillStyle = '#ffffff';
+        lctx.fillRect(-(layer.offsetX || 0), -(layer.offsetY || 0), pw, ph);
       }
-    });
+
+      const layerStrokes = state.strokes.filter(s => s.layerId === layer.id);
+      layerStrokes.forEach(stroke => renderStroke(lctx, stroke, layer.background));
+
+      lctx.restore();
+
+      // Composer en respectant l'opacité du calque
+      ctx.globalAlpha = layer.opacity;
+      ctx.drawImage(layerCanvas, 0, 0);
+      ctx.globalAlpha = 1;
+    }
 
     const dataUrl = exportCanvas.toDataURL('image/png');
     const a = document.createElement('a');
@@ -386,8 +438,22 @@ function App() {
         <div className="divider"></div>
 
         <div className="actions-group">
-          <button className="tool-btn action-btn" title="Zoomer" onClick={handleZoomIn}><ZoomIn size={24} /></button>
-          <button className="tool-btn action-btn" title="Dézoomer" onClick={handleZoomOut}><ZoomOut size={24} /></button>
+          <button 
+            className="tool-btn action-btn" 
+            title="Zoomer" 
+            onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); startZoomIn(); }}
+            onPointerUp={(e) => { e.currentTarget.releasePointerCapture(e.pointerId); stopZoom(); }}
+            onPointerLeave={stopZoom}
+            onPointerCancel={stopZoom}
+          ><ZoomIn size={24} /></button>
+          <button 
+            className="tool-btn action-btn" 
+            title="Dézoomer" 
+            onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); startZoomOut(); }}
+            onPointerUp={(e) => { e.currentTarget.releasePointerCapture(e.pointerId); stopZoom(); }}
+            onPointerLeave={stopZoom}
+            onPointerCancel={stopZoom}
+          ><ZoomOut size={24} /></button>
           <button className="tool-btn action-btn" title="Réinitialiser la vue" onClick={handleResetView}><Maximize size={24} /></button>
         </div>
 
