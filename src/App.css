@@ -450,3 +450,59 @@ body {
 .custom-inputs input[type=number] {
   -moz-appearance: textfield;
 }
+
+
+/* --- RESPONSIVE HEIGHT FOR SMALL SCREENS --- */
+@media (max-height: 850px) {
+  .toolbar {
+    gap: 8px;
+    padding: 10px 0;
+  }
+  .tools-group, .settings-group, .actions-group {
+    gap: 5px;
+  }
+  .divider {
+    margin: 2px 0;
+  }
+  .tool-btn {
+    padding: 6px;
+  }
+  .tool-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+@media (max-height: 700px) {
+  .toolbar {
+    gap: 4px;
+    padding: 5px 0;
+    width: 50px;
+  }
+  .tools-group, .settings-group, .actions-group {
+    gap: 2px;
+  }
+  .tool-btn {
+    padding: 4px;
+    border-radius: 6px;
+  }
+  .tool-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+@media (max-height: 600px) {
+  .toolbar {
+    overflow-y: auto;
+    overflow-x: visible;
+  }
+  .toolbar::-webkit-scrollbar {
+    width: 0px;
+    background: transparent;
+  }
+  .tool-settings-popover {
+    position: fixed;
+    left: 55px;
+  }
+}
